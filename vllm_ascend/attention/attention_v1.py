@@ -52,7 +52,6 @@ from vllm_ascend.attention.utils import (
     cache_graph_workspace,
     enable_cp,
     needs_layer_aware_fia_graph_replay,
-    notify_kv_cache_written,
     split_decodes_and_prefills,
     using_paged_attention,
 )
@@ -64,7 +63,6 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
@@ -521,7 +519,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.is_draft_model:
                 graph_params = get_draft_graph_params()
                 attn_metadata = draft_attn_metadatas
-                attn_keys = list(attn_metadata[0].keys())
+                draft_attn_key_steps = [
+                    (draft_step, key)
+                    for draft_step, per_step_metadata in enumerate(attn_metadata)
+                    for key in per_step_metadata
+                ]
+                attn_keys = [key for _, key in draft_attn_key_steps]
             else:
                 graph_params = get_graph_params()
                 attn_metadata = forward_context.attn_metadata
@@ -542,7 +545,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_param_count = len(captured_attn_params)
             workspace = graph_params.workspaces.get(num_tokens)
             if _EXTRA_CTX.is_draft_model:
-                attn_keys = attn_keys * (graph_param_count // num_layers)
+                if graph_param_count > len(draft_attn_key_steps):
+                    repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
+                    draft_attn_key_steps = (draft_attn_key_steps * repeat_count)[:graph_param_count]
+                else:
+                    draft_attn_key_steps = draft_attn_key_steps[:graph_param_count]
+                attn_keys = [key for _, key in draft_attn_key_steps]
             elif use_layer_aware_replay:
                 # One graph size can contain captured FIA ops from all layers.
                 # Repeat attn keys to match the captured op count, then use the
@@ -576,7 +584,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     ) = param
 
                     if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
+                        draft_step, key = draft_attn_key_steps[attn_count]
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                         attn_count = attn_count + 1
@@ -616,27 +624,56 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 else:
                     graph_params = get_draft_graph_params()
                 attn_metadata = draft_attn_metadatas
-                attn_keys = list(attn_metadata[0].keys())
+                draft_attn_key_steps = [
+                    (draft_step, key)
+                    for draft_step, per_step_metadata in enumerate(attn_metadata)
+                    for key in per_step_metadata
+                ]
+                attn_keys = [key for _, key in draft_attn_key_steps]
             else:
                 graph_params = get_graph_params()
                 attn_metadata = forward_context.attn_metadata
                 attn_keys = list(attn_metadata.keys())
                 if not use_layer_aware_replay:
-                    # Keep the original speculative-decoding ordering for
-                    # other models so EAGLE/DFlash graph replay keeps the
-                    # original ordering.
+                    # In some speculative methods (such as DFlash), the order of
+                    # attn_keys in the Target model will be disrupted instead of
+                    # increasing by layer index, so need regular expressions to
+                    # reorder the attn_keys and store the results in
+                    # _ATTN_KEYS_BUFFER.
                     attn_keys_length = len(graph_params.attn_params[num_tokens])
                     global _ATTN_KEYS_BUFFER
-                    if _ATTN_KEYS_BUFFER is None:
+                    if attn_keys_length == 0:
+                        return
+                    if not _ATTN_KEYS_BUFFER or len(_ATTN_KEYS_BUFFER) != attn_keys_length:
                         import regex as re
 
                         def extract_layer_index(key: str) -> int:
-                            match = re.search(r"(\d+)", key)
+                            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", key)
                             return int(match.group(1)) if match else 0
 
-                        attn_keys_tmp = attn_keys[:attn_keys_length]
+                        def is_direct_target_attn_key(key: str) -> bool:
+                            return (
+                                re.search(
+                                    r"(?:^|\.)layers\.(\d+)\.self_attn\.attn$",
+                                    key,
+                                )
+                                is not None
+                            )
+
+                        attn_keys_to_order = attn_keys[:attn_keys_length]
+                        if getattr(speculative_config, "method", None) == "mtp":
+                            # Step3.5 MTP can expose draft KV-cache groups in the
+                            # target runtime metadata.  The target FULL graph only
+                            # captures direct base-model self-attention handles, so
+                            # select that target key domain instead of depending on
+                            # the current draft module name.
+                            direct_target_attn_keys = [key for key in attn_keys if is_direct_target_attn_key(key)]
+                            if len(direct_target_attn_keys) >= attn_keys_length:
+                                attn_keys_to_order = direct_target_attn_keys
+
+                        attn_keys_tmp = attn_keys_to_order
                         attn_keys_tmp.sort(key=extract_layer_index)
-                        _ATTN_KEYS_BUFFER = attn_keys_tmp
+                        _ATTN_KEYS_BUFFER = attn_keys_tmp[:attn_keys_length]
                     attn_keys[:attn_keys_length] = _ATTN_KEYS_BUFFER
             # For Qwen3-next, since the kv_cache_config has already categorized
             # linear_attn and self_attn, the attn_metadata is first arranged with
@@ -654,7 +691,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_param_count = len(captured_attn_params)
             workspace = graph_params.workspaces.get(num_tokens)
             if _EXTRA_CTX.is_draft_model:
-                attn_keys = attn_keys * (graph_param_count // num_layers)
+                if graph_param_count > len(draft_attn_key_steps):
+                    repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
+                    draft_attn_key_steps = (draft_attn_key_steps * repeat_count)[:graph_param_count]
+                else:
+                    draft_attn_key_steps = draft_attn_key_steps[:graph_param_count]
+                attn_keys = [key for _, key in draft_attn_key_steps]
             elif use_layer_aware_replay:
                 # Keep the replay loop length aligned with captured FIA ops;
                 # layer-specific metadata lookup below prevents global/sliding
@@ -693,12 +735,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     ) = param
 
                     if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        block_tables = attn_metadata[draft_step][key].block_tables
+                        draft_step, key = draft_attn_key_steps[attn_count]
+                        metadata = attn_metadata[draft_step][key]
+                        seq_lens = metadata.seq_lens_list
+                        actual_seq_lengths_q = metadata.actual_seq_lengths_q
+                        block_tables = metadata.block_tables
                         attn_count = attn_count + 1
-                        if not attn_metadata[draft_step][key].causal:
+                        if not metadata.causal:
                             sparse_mode = 0
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
@@ -1382,6 +1425,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         if len(kv_cache) > 1:
+            if self.is_kv_producer:
+                attn_metadata.reshape_cache_event = torch.npu.Event()
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
@@ -1395,7 +1440,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
                 slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
             )
-            notify_kv_cache_written()
+            if self.is_kv_producer:
+                attn_metadata.reshape_cache_event.record()
         return query, key, value, output
 
     def forward_impl(
@@ -1408,7 +1454,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
-        record_attention_compute_start()
         if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and using_paged_attention(num_tokens, self.vllm_config)
@@ -1905,6 +1950,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         output: torch.Tensor,
     ):
         if len(kv_cache) > 1:
+            if self.is_kv_producer:
+                attn_metadata.reshape_cache_event = torch.npu.Event()
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
@@ -1924,5 +1971,6 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots,
             )
 
-            notify_kv_cache_written()
+            if self.is_kv_producer:
+                attn_metadata.reshape_cache_event.record()
         return query, key, value, output

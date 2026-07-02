@@ -9,7 +9,12 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_config,
+    get_ascend_device_type,
+    is_pd_decode_recompute_scheduler_enabled,
+)
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 
@@ -351,6 +356,11 @@ def split_decodes_and_prefills(
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
+    # PD D + RecomputeScheduler: num_computed may be N-1 after KV recv while
+    # this step is MTP decode (max_query_len <= threshold).
+    if is_pd_decode_recompute_scheduler_enabled():
+        treat_short_extends_as_decodes = True
+
     if (
         max_query_len <= decode_threshold
         and (not require_uniform or decode_threshold <= 1)
@@ -422,26 +432,6 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
-
-
-def notify_kv_cache_written(layer_name: str = ""):
-    """Notify the connector that the paged KV cache for ``layer_name`` has been
-    written for the current step.
-
-    The attention layer calls this unconditionally; each connector decides whether
-    it needs to record a synchronization primitive (e.g. a compute-stream event
-    later waited on by the resharding stream to overlap the outgoing KV copy).
-    Connectors that don't need it -- such as the AscendStore pool connector, which
-    records its own sync event at save time -- simply do not implement
-    ``on_kv_cache_written`` and this becomes a no-op.
-    """
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return
-
-    connector = get_kv_transfer_group()
-    on_kv_cache_written = getattr(connector, "on_kv_cache_written", None)
-    if on_kv_cache_written is not None:
-        on_kv_cache_written(layer_name)
 
 
 def round_up(val: int, align: int) -> int:
