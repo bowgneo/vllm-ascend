@@ -410,6 +410,19 @@ class KVPoolWorker:
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
 
+        # group_num_layers is computed from the actual kv_caches dict which
+        # includes ALL attention layers (main + MTP), so it is the authoritative
+        # layer count for this worker.
+        original_num_layers = self.num_layers
+        self.num_layers = sum(self.group_num_layers.values())
+        if self.num_layers != original_num_layers:
+            logger.info(
+                "KVPoolWorker: updated num_layers %d -> %d "
+                "(includes MTP/spec-decode draft layers).",
+                original_num_layers,
+                self.num_layers,
+            )    
+
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_group_buffers(
             self.group_kv_caches_base_addr,
@@ -530,6 +543,8 @@ class KVPoolWorker:
                     key_list = []
                     block_id_list: list[int] = []
                     for group_id in load_group_ids:
+                        if group_id >= len(request.block_ids_by_group):
+                            continue
                         block_ids = request.block_ids_by_group[group_id]
                         group_block_size = self.grouped_block_size[group_id]
                         mask_num = request.load_spec.vllm_cached_tokens // group_block_size * group_block_size
@@ -629,6 +644,12 @@ class KVPoolWorker:
         return invalid_blocks
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
+        # MTP speculative decoding re-runs the base model's attention layers
+        # during draft execution (_run_merged_draft), causing extra
+        # save_kv_layer calls beyond num_layers. These extra calls would
+        # exhaust the store_layer generators and raise StopIteration.
+        if self.current_layer >= self.num_layers:
+            return
         if self.current_layer == 0:
             self.layerwise_storers = []
             current_event = None
