@@ -408,7 +408,16 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_metadata_lock = threading.Lock()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        first_kv_cache = next(iter(self.kv_caches.values()))
+        # NPU device selection is thread-local. Executor workers do not inherit
+        # the device selected by the model worker thread and would otherwise
+        # use device 0 on their first NPU operation.
+        kv_cache_device = first_kv_cache[0].device
+        self.executor = ThreadPoolExecutor(
+            max_workers=32,
+            initializer=torch.npu.set_device,
+            initargs=(kv_cache_device,),
+        )
         self.peer_request_queues: defaultdict[tuple[str, int], deque[dict[str, Any]]] = defaultdict(deque)
         self.active_peer_request_handlers: set[tuple[str, int]] = set()
         self.peer_request_queues_lock = threading.Lock()
@@ -1070,8 +1079,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
+    def __init__(  # type: ignore[misc]
+        self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None
+    ):
         assert vllm_config.kv_transfer_config is not None
+        self._kv_transfer_config = vllm_config.kv_transfer_config
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeConnectorMetadata()
 

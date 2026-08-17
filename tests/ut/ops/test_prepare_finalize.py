@@ -14,18 +14,8 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
 class TestPrepareAndFinalize(unittest.TestCase):
     def setUp(self):
         # Mock FusedMoEConfig
-        fake_stream = MagicMock()
-        patcher = patch("torch.npu.Stream", return_value=fake_stream)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.mock_get_config = patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_ascend_config")
-        mock_config = self.mock_get_config.start()
         mock_ascend_config = MagicMock()
-        mock_ascend_config.multistream_overlap_gate = False
         mock_ascend_config.enable_context_parallel = False
-        mock_ascend_config.enable_flashcomm2_parallel_size = 0
-        mock_config.return_value = mock_ascend_config
-        self.addCleanup(self.mock_get_config.stop)
         self.mock_get_config_utils = patch("vllm_ascend.utils.get_ascend_config")
         mock_config_utils = self.mock_get_config_utils.start()
         mock_config_utils.return_value = mock_ascend_config
@@ -84,9 +74,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(4, 8)
         router_logits = torch.randn(4, 2)
 
-        prepare_output = layer.prepare(
-            hidden_states, router_logits, enable_shared_expert_dp=False, replace_allreduce=False
-        )
+        prepare_output = layer.prepare(hidden_states, router_logits, replace_allreduce=False)
         h_out = prepare_output.hidden_states
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
 
@@ -135,9 +123,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(2, 8)
         router_logits = torch.randn(2, 2)
 
-        prepare_output = layer.prepare(
-            hidden_states, router_logits, enable_shared_expert_dp=False, replace_allreduce=False
-        )
+        prepare_output = layer.prepare(hidden_states, router_logits, replace_allreduce=False)
         h_out = prepare_output.hidden_states
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
 

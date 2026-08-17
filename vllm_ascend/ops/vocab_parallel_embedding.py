@@ -134,7 +134,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             weight_loader=self.weight_loader,
         )
 
-    def _get_masked_input_and_mask(
+    def _mask_input_for_vocab_range(
         self,
         input_: torch.Tensor,
         org_vocab_start_index: int,
@@ -207,7 +207,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
 
         # Masking unchanged; padding rows map to OOB and get masked to 0
         # via masked_fill_ below (token_id=0 stays in-range after shift).
-        masked_input, input_mask = self._get_masked_input_and_mask(
+        masked_input, input_mask = self._mask_input_for_vocab_range(
             complete_input,
             self.shard_indices.org_vocab_start_index,
             self.shard_indices.org_vocab_end_index,
@@ -229,7 +229,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     def _forward_origin(self, input_):
         if self.tp_size > 1:
             # Build the mask.
-            masked_input, input_mask = self._get_masked_input_and_mask(
+            masked_input, input_mask = self._mask_input_for_vocab_range(
                 input_,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
@@ -253,7 +253,7 @@ class AscendParallelLMHead(ParallelLMHead):
     """
     Register ParallelLMHead as a custom op for Ascend."""
 
-    def __init__(
+    def __init__(  # type: ignore[misc]
         self,
         num_embeddings: int,
         embedding_dim: int,
@@ -263,9 +263,20 @@ class AscendParallelLMHead(ParallelLMHead):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        disable_tp: bool = False,
     ):
+        self.disable_tp = disable_tp
+
         AscendVocabParallelEmbedding.__init__(
-            self, num_embeddings, embedding_dim, params_dtype, org_num_embeddings, padding_size, quant_config, prefix
+            self,
+            num_embeddings,
+            embedding_dim,
+            params_dtype,
+            org_num_embeddings,
+            padding_size,
+            quant_config,
+            prefix,
         )
 
         self.quant_config = quant_config
@@ -288,6 +299,14 @@ class AscendLogitsProcessor(LogitsProcessor):
     Added the feature of lmheadTP in pure dp scenario
     """
 
+    def _apply_head(
+        self,
+        lm_head: AscendParallelLMHead,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return super()._apply_head(lm_head, hidden_states, embedding_bias)
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -307,7 +326,7 @@ class AscendLogitsProcessor(LogitsProcessor):
     ) -> torch.Tensor | None:
         # Gather hidden states from all devices in tensor parallel group
         gathered_hidden_states = get_lmhead_tp_group().all_gather(hidden_states, dim=0)
-        logits = lm_head.quant_method.apply(lm_head, gathered_hidden_states, bias=embedding_bias)
+        logits = self._apply_head(lm_head, gathered_hidden_states, embedding_bias)
         # Gather logits for tensor parallel
         if not get_ascend_config().enable_reduce_sample:
             logits = get_lmhead_tp_group().all_to_all(logits)
@@ -326,7 +345,7 @@ class AscendLogitsProcessor(LogitsProcessor):
         lm_head: AscendParallelLMHead,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         # Gather logits for tensor parallel
         if not get_ascend_config().enable_reduce_sample:
             logits = self._gather_logits(logits)

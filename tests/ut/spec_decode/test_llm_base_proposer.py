@@ -24,6 +24,7 @@ import pytest
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
+from vllm_ascend.spec_decode.utils import _disable_flash_comm_v1_context
 
 # CUDAGraphMode values whose ``has_full_cudagraphs()`` is True: FULL plus the
 # two composite modes that mix FULL with NONE / PIECEWISE.
@@ -38,6 +39,63 @@ NON_FULL_CUDAGRAPH_MODES = [
     CUDAGraphMode.NONE,
     CUDAGraphMode.PIECEWISE,
 ]
+
+
+class TestMultimodalImageTokenIndex:
+    @pytest.mark.parametrize(
+        "model_name",
+        [
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Step3p7ForConditionalGeneration",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        ],
+    )
+    def test_models_using_image_token_id(self, model_name: str):
+        config = SimpleNamespace(image_token_id=123, image_token_index=456)
+
+        image_token_index = AscendSpecDecodeBaseProposer._get_multimodal_image_token_index(model_name, config)
+
+        assert image_token_index == 123
+
+    def test_pixtral_uses_vision_config_image_token_id(self):
+        config = SimpleNamespace(
+            image_token_id=123,
+            image_token_index=456,
+            vision_config=SimpleNamespace(image_token_id=789),
+        )
+
+        image_token_index = AscendSpecDecodeBaseProposer._get_multimodal_image_token_index(
+            "PixtralForConditionalGeneration", config
+        )
+
+        assert image_token_index == 789
+
+    def test_kimi_uses_media_placeholder_token_id(self):
+        config = SimpleNamespace(
+            image_token_id=123,
+            image_token_index=456,
+            media_placeholder_token_id=789,
+        )
+
+        image_token_index = AscendSpecDecodeBaseProposer._get_multimodal_image_token_index(
+            "KimiK25ForConditionalGeneration", config
+        )
+
+        assert image_token_index == 789
+
+    def test_default_uses_image_token_index(self):
+        config = SimpleNamespace(image_token_id=123, image_token_index=456)
+
+        image_token_index = AscendSpecDecodeBaseProposer._get_multimodal_image_token_index(
+            "OtherForConditionalGeneration", config
+        )
+
+        assert image_token_index == 456
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:
@@ -110,3 +168,45 @@ class TestDisablePaddedDrafterBatchWithFullGraph:
         )
 
         proposer._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
+
+
+class TestDisableFlashCommV1Context:
+    """``_disable_flash_comm_v1_context`` temporarily clears
+    ``forward_context.flash_comm_v1_enabled`` while MarkovHead runs -- MarkovHead
+    operates in the all-gathered full space, so SP's reduce-scatter must not
+    split ``markov_emb`` -- then restores the original value on exit, including
+    on exception. See commit c62ef687b ([BugFix] Fix `sp` in dspark).
+    """
+
+    @staticmethod
+    def _patch_forward_context(monkeypatch, flash_comm_v1_enabled: bool):
+        ctx = SimpleNamespace(flash_comm_v1_enabled=flash_comm_v1_enabled)
+        monkeypatch.setattr(
+            "vllm_ascend.spec_decode.utils.get_forward_context",
+            lambda: ctx,
+        )
+        return ctx
+
+    def test_clears_while_inside_when_sp_on(self, monkeypatch):
+        ctx = self._patch_forward_context(monkeypatch, True)
+        with _disable_flash_comm_v1_context():
+            assert ctx.flash_comm_v1_enabled is False
+
+    def test_restores_true_on_exit(self, monkeypatch):
+        ctx = self._patch_forward_context(monkeypatch, True)
+        with _disable_flash_comm_v1_context():
+            pass
+        assert ctx.flash_comm_v1_enabled is True
+
+    def test_restores_false_on_exit(self, monkeypatch):
+        """SP already off -> clearing is a no-op, original False preserved."""
+        ctx = self._patch_forward_context(monkeypatch, False)
+        with _disable_flash_comm_v1_context():
+            assert ctx.flash_comm_v1_enabled is False
+        assert ctx.flash_comm_v1_enabled is False
+
+    def test_restores_on_exception(self, monkeypatch):
+        ctx = self._patch_forward_context(monkeypatch, True)
+        with pytest.raises(RuntimeError, match="boom"), _disable_flash_comm_v1_context():
+            raise RuntimeError("boom")
+        assert ctx.flash_comm_v1_enabled is True

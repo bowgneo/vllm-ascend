@@ -10,7 +10,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -23,10 +23,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import enable_dsa_cp, vllm_version_is
-
-if not vllm_version_is("0.23.0"):
-    from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+from vllm_ascend.utils import enable_dsa_cp
 
 from .deepseek_v4 import (
     DeepseekV2DecoderLayer,
@@ -62,6 +59,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
         quant_config = vllm_config.quant_config
 
         self.e_proj = ReplicatedLinear(
@@ -123,11 +121,18 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
 
-        hidden_states, residual = self.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
+        hidden_states, residual = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+            input_ids=None,
+        )
 
         # hidden_states = self.hc_head(hidden_states, self.hc_head_fn,
         #                              self.hc_head_scale, self.hc_head_base)
 
+        if self.use_v2_model_runner:
+            return hidden_states.flatten(1)
         return hidden_states
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
@@ -260,26 +265,15 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        if vllm_version_is("0.23.0"):
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                model=self.model,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.n_routed_experts
-                + (self.config.n_shared_experts if rocm_aiter_moe_shared_expert_enabled else 0),
-                num_redundant_experts=self.num_redundant_experts,
-            )
-        else:
-            expert_params_mapping = fused_moe_make_expert_params_mapping(
-                model=self.model,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.n_routed_experts
-                + (self.config.n_shared_experts if rocm_aiter_moe_shared_expert_enabled else 0),
-                num_redundant_experts=self.num_redundant_experts,
-            )
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            model=self.model,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts if rocm_aiter_moe_shared_expert_enabled else 0),
+            num_redundant_experts=self.num_redundant_experts,
+        )
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
