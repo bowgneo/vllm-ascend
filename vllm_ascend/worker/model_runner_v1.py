@@ -2247,7 +2247,24 @@ class NPUModelRunner(GPUModelRunner):
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
-                self.finalize_kv_connector()
+                if kv_connector_output is None:
+                    self.finalize_kv_connector()
+                else:
+                    kv_connector = get_kv_transfer_group()
+                    kv_connector.wait_for_save()
+                    finished_sending, finished_recving = kv_connector.get_finished(
+                        scheduler_output.finished_req_ids
+                    )
+                    kv_connector_output.finished_sending = (
+                        kv_connector_output.finished_sending or set()
+                    ) | (finished_sending or set())
+                    kv_connector_output.finished_recving = (
+                        kv_connector_output.finished_recving or set()
+                    ) | (finished_recving or set())
+                    kv_connector_output.invalid_block_ids |= (
+                        kv_connector.get_block_ids_with_load_errors()
+                    )
+                    kv_connector.clear_connector_metadata()
 
             draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
             if draft_token_ids is not None:
