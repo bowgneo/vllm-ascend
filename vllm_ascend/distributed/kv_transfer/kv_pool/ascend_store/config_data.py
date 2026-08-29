@@ -420,6 +420,14 @@ class ChunkedTokenDatabase:
         length = len(group_block_len)
         if length == 0:
             return addr_list, size_list, block_id
+        if group_block_stride is not None and len(group_addrs) == length == len(group_block_stride):
+            token_span = end - start
+            addr_list = [
+                base_addr + block_id * block_stride
+                for base_addr, block_stride in zip(group_addrs, group_block_stride, strict=True)
+            ]
+            size_list = [int(block_len / group_block_size * token_span) for block_len in group_block_len]
+            return addr_list, size_list, block_id
         for index, base_addr in enumerate(group_addrs):
             block_len = group_block_len[index % length]
             block_stride = group_block_stride[index % length] if group_block_stride else block_len
