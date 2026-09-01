@@ -136,6 +136,21 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         for call in self.mock_maybe_trans_nz.call_args_list:
             self.assertEqual(call.kwargs["customize_dtype"], torch.float8_e4m3fn)
 
+    def test_process_weights_fused_mc2_applies_maybe_trans_nz(self):
+        layer = create_mxfp_moe_layer(
+            num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
+        )
+        with patch(
+            "vllm_ascend.quantization.methods.w8a8_mxfp8.get_ascend_config"
+        ) as mock_get:
+            mock_config = create_mock_ascend_config()
+            mock_config.enable_fused_mc2 = 1
+            mock_get.return_value = mock_config
+            self.scheme.process_weights_after_loading(layer)
+        self.assertEqual(self.mock_maybe_trans_nz.call_count, 2)
+        for call in self.mock_maybe_trans_nz.call_args_list:
+            self.assertEqual(call.kwargs["customize_dtype"], torch.float8_e4m3fn)
+
     def test_restore_weights_for_rl_loading(self):
         layer = create_mxfp_moe_layer(
             num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
