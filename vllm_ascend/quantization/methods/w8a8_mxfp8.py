@@ -369,8 +369,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data, customize_dtype=torch.float8_e4m3fn)
             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data, customize_dtype=torch.float8_e4m3fn)
-            layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(torch.float8_e8m0fnu).contiguous()
-            layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(torch.float8_e8m0fnu).contiguous()
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2).contiguous().view(torch.float8_e8m0fnu)
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2).contiguous().view(torch.float8_e8m0fnu)
         else:
             layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
             layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
