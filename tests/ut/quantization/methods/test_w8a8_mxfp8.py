@@ -140,6 +140,7 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         layer = create_mxfp_moe_layer(
             num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
         )
+        original_shape = layer.w13_weight.shape
         with patch(
             "vllm_ascend.quantization.methods.w8a8_mxfp8.get_ascend_config"
         ) as mock_get:
@@ -147,6 +148,9 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
             mock_config.enable_fused_mc2 = 1
             mock_get.return_value = mock_config
             self.scheme.process_weights_after_loading(layer)
+        self.assertEqual(layer.w13_weight.shape, (original_shape[0], original_shape[2], original_shape[1]))
+        self.assertTrue(layer.w13_weight.data.is_contiguous())
+        self.assertTrue(layer.w2_weight.data.is_contiguous())
         self.assertEqual(self.mock_maybe_trans_nz.call_count, 2)
         for call in self.mock_maybe_trans_nz.call_args_list:
             self.assertEqual(call.kwargs["customize_dtype"], torch.float8_e4m3fn)
