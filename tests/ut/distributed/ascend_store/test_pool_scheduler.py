@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm.v1.request import RequestStatus
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -257,6 +258,58 @@ class TestKVPoolScheduler(unittest.TestCase):
         request.request_id = "r1"
         delay, _ = scheduler.request_finished(request, [1, 2])
         self.assertTrue(delay)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_request_finished_free_after_sync_save(self, mock_client_cls):
+        config = self._make_config(extra_config={"load_async": True, "free_after_sync_save": True})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import RequestTracker
+
+        scheduler._request_trackers["r1"] = RequestTracker(
+            req_id="r1",
+            token_len=32,
+            allocated_block_ids=[0, 1],
+            num_saved_tokens=32,
+        )
+        scheduler._delayed_free_req_ids.add("r1")
+        request = MagicMock()
+        request.request_id = "r1"
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.num_in_flight_tokens = 0
+
+        delay, _ = scheduler.request_finished(request, [1, 2])
+
+        self.assertFalse(delay)
+        self.assertNotIn("r1", scheduler._delayed_free_req_ids)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_request_finished_free_after_sync_save_keeps_unsafe_finishes_delayed(self, mock_client_cls):
+        config = self._make_config(extra_config={"load_async": True, "free_after_sync_save": True})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import RequestTracker
+
+        scheduler._request_trackers["r1"] = RequestTracker(
+            req_id="r1",
+            token_len=32,
+            allocated_block_ids=[0, 1],
+            num_saved_tokens=32,
+        )
+        request = MagicMock()
+        request.request_id = "r1"
+
+        for status, in_flight_tokens in (
+            (RequestStatus.FINISHED_ABORTED, 0),
+            (RequestStatus.FINISHED_STOPPED, 1),
+        ):
+            with self.subTest(status=status, in_flight_tokens=in_flight_tokens):
+                scheduler._delayed_free_req_ids.clear()
+                request.status = status
+                request.num_in_flight_tokens = in_flight_tokens
+
+                delay, _ = scheduler.request_finished(request, [1, 2])
+
+                self.assertTrue(delay)
+                self.assertIn("r1", scheduler._delayed_free_req_ids)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_request_finished_empty_blocks(self, mock_client_cls):
@@ -1008,10 +1061,10 @@ class TestKVPoolSchedulerRequestFinishedAllGroups(unittest.TestCase):
     """Test request_finished_all_groups."""
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
-    def _make_scheduler(self, mock_client_cls, kv_role="kv_producer"):
+    def _make_scheduler(self, mock_client_cls, kv_role="kv_producer", extra_config=None):
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
-        config.kv_transfer_config.kv_connector_extra_config = {}
+        config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
         config.kv_transfer_config.get_from_extra_config.return_value = True
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.prefill_context_parallel_size = 1
@@ -1065,6 +1118,22 @@ class TestKVPoolSchedulerRequestFinishedAllGroups(unittest.TestCase):
         delay, _ = scheduler.request_finished_all_groups(request, ([1, 2],))
         self.assertTrue(delay)
         self.assertIn("r1", scheduler._delayed_free_req_ids)
+
+    def test_free_after_sync_save(self):
+        scheduler = self._make_scheduler(extra_config={"load_async": True, "free_after_sync_save": True})
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import RequestTracker
+
+        scheduler._request_trackers["r1"] = RequestTracker("r1", 32, allocated_block_ids=[0, 1], num_saved_tokens=32)
+        scheduler._delayed_free_req_ids.add("r1")
+        request = MagicMock()
+        request.request_id = "r1"
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        request.num_in_flight_tokens = 0
+
+        delay, _ = scheduler.request_finished_all_groups(request, ([1, 2],))
+
+        self.assertFalse(delay)
+        self.assertNotIn("r1", scheduler._delayed_free_req_ids)
 
     def test_no_delay_empty_blocks(self):
         scheduler = self._make_scheduler()

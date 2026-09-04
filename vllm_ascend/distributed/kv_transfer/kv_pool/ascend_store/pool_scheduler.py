@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
@@ -92,6 +92,9 @@ class KVPoolScheduler:
             "consumer_is_to_put", False
         )
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        self.free_after_sync_save = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "free_after_sync_save", False
+        )
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(kv_event_config and kv_event_config.enable_kv_cache_events)
         retention_interval = getattr(envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
@@ -1044,6 +1047,32 @@ class KVPoolScheduler:
             else:
                 self.sending_events[event_id] = total
 
+    def _can_free_after_sync_save(self, request: "Request") -> bool:
+        """Return whether the model output proves this request's save is done.
+
+        The non-layerwise worker waits for its send queue in ``wait_for_save``
+        before returning a model output. For a naturally finished request with
+        no in-flight tokens, delaying its blocks until a later
+        ``finished_sending`` report is redundant. Releasing immediately also
+        lets the following remote KV load reuse the blocks without waiting for
+        another model output in either synchronous or async scheduling.
+
+        Keep abort/error paths on the delayed-free protocol because they may not
+        be processing the model output that performed the save.
+        """
+        naturally_finished = request.status in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+        return (
+            self.kv_role == "kv_producer"
+            and self.free_after_sync_save
+            and self.load_async
+            and not self.use_layerwise
+            and naturally_finished
+            and request.num_in_flight_tokens == 0
+        )
+
     def request_finished(
         self,
         request: "Request",
@@ -1062,6 +1091,13 @@ class KVPoolScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is None or tracker.num_saved_tokens <= 0:
             self._delayed_free_req_ids.discard(request.request_id)
+            return False, None
+        if self._can_free_after_sync_save(request):
+            self._delayed_free_req_ids.discard(request.request_id)
+            logger.debug(
+                "Freeing request %s after synchronous KV save completion",
+                request.request_id,
+            )
             return False, None
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
@@ -1087,6 +1123,13 @@ class KVPoolScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is not None and tracker.num_saved_tokens <= 0:
             self._delayed_free_req_ids.discard(request.request_id)
+            return False, None
+        if tracker is not None and self._can_free_after_sync_save(request):
+            self._delayed_free_req_ids.discard(request.request_id)
+            logger.debug(
+                "Freeing request %s after synchronous KV save completion",
+                request.request_id,
+            )
             return False, None
         block_ids = cast(tuple[list[int], ...], self.get_sw_clipped_blocks(block_ids))
         valid_group_block_ids = [group_block_ids for group_block_ids in block_ids if group_block_ids]
