@@ -15,6 +15,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
 class _MetricChild:
     def __init__(self):
         self.value = 0
+        self.observed: list[float] = []
 
     def set(self, value):
         self.value = value
@@ -23,7 +24,7 @@ class _MetricChild:
         self.value += value
 
     def observe(self, value):
-        self.value += value
+        self.observed.append(value)
 
 
 class _Metric:
@@ -71,5 +72,5 @@ def test_prom_metrics_observe():
 
     assert prom._delayed_release_requests[0].value == 2
     assert prom._delayed_release_blocks[0].value == 5
-    assert abs(prom._load_get_duration[0].value - 0.03) < 1e-9
+    assert prom._load_get_duration[0].observed == [0.01, 0.02]
     assert prom._load_get_keys[0].value == 8
