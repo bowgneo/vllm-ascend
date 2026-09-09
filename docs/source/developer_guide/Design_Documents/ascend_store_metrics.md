@@ -1,10 +1,13 @@
-# RFC: AscendStore KV Pool Metrics
+# [RFC]: Add AscendStore KV Pool Metrics
 
 > **Status:** Draft
 >
 > **Target:** vLLM Ascend 0.27
 >
 > **Audience:** vLLM Ascend maintainers and operators of AscendStore KV pools
+>
+> **Artifact:** Community RFC Issue body prepared for review. This branch is
+> not a proposal to merge this file as a permanent design document.
 
 This RFC proposes four AscendStore metric families. Two Gauges report the
 current scheduler state: how many completed requests still retain KV blocks
@@ -19,7 +22,7 @@ For the surrounding KV pool architecture, see the
 offload protocol, see
 [Layerwise and Sparse KV Cache Offloading Design](layerwise_and_sparse_kv_cache_offloading.md).
 
-## 1. Motivation
+## Motivation
 
 AscendStore can retain a completed request's local KV blocks until every
 worker reports that the request's asynchronous save has finished. Existing
@@ -36,9 +39,11 @@ questions:
 The delayed-release state is the primary requirement. GET telemetry is
 secondary and must not add material overhead to the transfer path.
 
-## 2. Goals and non-goals
+## Proposed Change
 
-### Goals
+### Goals and non-goals
+
+#### Goals
 
 - Expose the current number of completed requests waiting to release KV
   blocks.
@@ -51,7 +56,7 @@ secondary and must not add material overhead to the transfer path.
 - Keep the design compatible with later operation-level metrics when a concrete
   requirement exists.
 
-### Non-goals
+#### Non-goals
 
 - Expose request IDs or per-request block counts as Prometheus labels.
 - Count how many requests have ever experienced delayed release.
@@ -67,7 +72,7 @@ labels would create high-cardinality time series and eventually burden both
 the serving process and Prometheus. Debug logging may identify a request, while
 metrics quantify current service-level impact.
 
-## 3. Metric contract
+### Metric contract
 
 The proposal adds four metric families. The `engine` and `model_name` labels
 come from vLLM's existing per-engine metric infrastructure.
@@ -88,7 +93,7 @@ The delayed-release metrics intentionally have no Counter counterpart. A
 cumulative transition count does not answer the primary question, which is
 whether completed requests are retaining KV blocks now.
 
-### Histogram output
+#### Histogram output
 
 The GET Histogram uses these explicit upper bounds, in seconds:
 
@@ -111,9 +116,36 @@ The Prometheus Python client may also expose `_created` series for the
 Histogram and Counter. Those timestamps are client-generated metadata and are
 not part of this RFC's operational contract.
 
-## 4. Design
+### Design
 
-### 4.1 Reuse the vLLM connector-statistics pipeline
+The design separates current scheduler state from worker transfer events. It
+uses the component that owns each fact as its source of truth and carries both
+through vLLM's existing stats channel.
+
+| Design concern | Decision | Reason |
+| :--- | :--- | :--- |
+| Delayed-release authority | Track requests and blocks in `KVPoolScheduler` | The scheduler decides whether vLLM may free request blocks |
+| GET measurement point | Time one `Backend.get` batch in the worker path | This isolates backend latency without timing key construction or scheduling |
+| Cross-worker semantics | Let `KVOutputAggregator` merge observations and gate completion | This preserves vLLM's existing all-worker protocol and adds no RPC |
+| Current versus historical values | Use Gauges for delayed state and Histogram/Counter for GET events | Metric type matches the operational question |
+| Cardinality | Keep only vLLM's bounded `engine` and `model_name` labels | Request IDs and worker ranks would create unnecessary series |
+| Prometheus work | Register and update metrics in the existing logger path | Transfer threads only record small Python values |
+
+#### Component responsibilities
+
+| Component | Responsibility | Metric data owned |
+| :--- | :--- | :--- |
+| `KVPoolScheduler` | Decide whether finished-request blocks remain retained and consume completed-send output | Current delayed request set, per-request block counts, and total retained blocks |
+| `KVPoolWorker` and receive thread | Execute non-layerwise GET and snapshot interval observations | Per-worker batch durations and submitted key increments |
+| `KVOutputAggregator` | Merge worker output and wait for every expected worker's completion | Combined GET observations and aggregated `finished_sending` |
+| vLLM scheduler | Apply connector output, merge worker and scheduler stats, and release eligible blocks | One connector-stats payload per scheduler result |
+| `AscendStorePromMetrics` | Register fixed metric families and dispatch `set`, `observe`, and `inc` | Per-engine Prometheus collectors |
+| vLLM API server | Serve the process registry | Read-only `/metrics` response |
+
+No component owns both an individual request label and a Prometheus series.
+The scheduler retains request IDs only for internal completion matching.
+
+#### Reuse the vLLM connector-statistics pipeline
 
 The implementation follows the extension points already used by upstream
 connectors such as Mooncake Store:
@@ -140,7 +172,7 @@ flowchart LR
 Scraping `/metrics` only reads the Prometheus registry in the serving process.
 It does not synchronously query workers or trigger a collective RPC.
 
-### 4.2 Track delayed release at the scheduler
+#### Track delayed release at the scheduler
 
 The scheduler owns block allocation and the decision to delay block release,
 so it is the authoritative source for both delayed-release Gauges.
@@ -169,7 +201,28 @@ The delayed state excludes these paths:
 - a request with no saved tokens; and
 - a request with no retained blocks.
 
-### 4.3 Preserve all-worker completion semantics
+The scheduler maintains these invariants:
+
+```text
+delayed_release_requests = len(delayed_request_ids)
+delayed_release_blocks = sum(blocks_by_request.values())
+```
+
+It updates the two Gauge fields in one stats payload after each real state
+transition. A running block total makes the transition O(1); the implementation
+does not recompute the sum on every scheduler step.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotTracked
+    NotTracked --> WaitingForSave: request_finished delays block release
+    WaitingForSave --> WaitingForSave: only some workers have completed
+    WaitingForSave --> Released: all workers report finished_sending
+    WaitingForSave --> Released: request cleanup or preemption
+    Released --> [*]
+```
+
+#### Preserve all-worker completion semantics
 
 Each worker reports completed sends through the existing model-runner output.
 `KVOutputAggregator` keeps a remaining-worker count per request and emits the
@@ -183,7 +236,7 @@ For example, if two tensor-parallel workers each perform one 5 ms GET with
 eight keys, the final metrics add two observations and 16 keys. They do not
 invent a single request-level 5 ms or 10 ms sample.
 
-### 4.4 Explain `wait_for_save()` and the next-step window
+#### Delayed-release sequence and `wait_for_save()`
 
 For the non-layerwise path, `wait_for_save()` enqueues the current step's save
 work and calls `request_queue.join()`. The join waits until the worker transfer
@@ -203,7 +256,42 @@ already returned. The Gauge measures the scheduler-visible lifetime of retained
 blocks, not only backend execution time. If completion is consumed quickly,
 the nonzero interval may be shorter than a Prometheus scrape interval.
 
-### 4.5 Record GET latency at backend-batch granularity
+The following sequence shows why a completed save can still produce a
+scheduler-visible delayed-release interval:
+
+```mermaid
+sequenceDiagram
+    participant Core as vLLM Scheduler
+    participant Pool as KVPoolScheduler
+    participant Worker as Worker(s)
+    participant Agg as KVOutputAggregator
+
+    Note over Core,Worker: Step N metadata is built before request R generates its final token
+    Core->>Pool: build_connector_meta(step N)
+    Pool-->>Worker: delayed_free_req_ids does not contain R
+    Worker->>Worker: enqueue save and request_queue.join()
+    Worker->>Worker: retain R in finished_requests
+    Worker-->>Agg: existing ModelRunnerOutput
+    Agg-->>Core: aggregated worker output
+    Core->>Pool: request_finished(R, block_ids)
+    Pool->>Pool: add R and publish requests=1, blocks=B
+    Core->>Core: keep R's KV blocks allocated
+
+    Note over Core,Worker: A later step or no-forward cycle carries the new scheduler state
+    Core->>Pool: build_connector_meta(next cycle)
+    Pool-->>Worker: delayed_free_req_ids contains R
+    Worker-->>Agg: finished_sending includes R
+    Agg->>Agg: wait for every expected worker
+    Agg-->>Core: aggregated finished_sending includes R
+    Core->>Pool: update_connector_output()
+    Pool->>Pool: remove R and publish requests=0, blocks=0
+    Core->>Core: free R's KV blocks
+```
+
+If more requests enter while R is waiting, the published values are the size
+and block total of the complete delayed set, not fixed values of one and B.
+
+#### Record GET latency at backend-batch granularity
 
 The synchronous, asynchronous, and tensor-parallel-mismatch non-layerwise load
 paths use the same recording boundary:
@@ -223,7 +311,47 @@ backend call and the implementation records its total duration and submitted
 keys. The key Counter therefore means submitted keys, not successful, unique,
 or cache-hit keys.
 
-### 4.6 Keep transient stats bounded
+#### GET collection and publishing sequence
+
+GET instrumentation records locally and publishes later. The backend call does
+not hold the stats lock, and an HTTP scrape never calls a worker.
+
+```mermaid
+sequenceDiagram
+    participant Load as Sync or async load path
+    participant Backend as AscendStore Backend
+    participant Stats as Worker interval stats
+    participant Agg as KVOutputAggregator
+    participant Sched as vLLM Scheduler
+    participant Logger as Stat logger
+    participant Registry as Prometheus registry
+    participant Scraper as Prometheus or plugin
+
+    Load->>Load: start = time.perf_counter()
+    Load->>Backend: get(keys, addresses, sizes)
+    alt Backend returns
+        Backend-->>Load: result codes
+        Load->>Stats: record_operation(load_get, elapsed, len(keys))
+        Note over Load,Stats: One short lock per backend batch, not per key
+    else Backend raises
+        Backend-->>Load: exception
+        Note over Load,Stats: Propagate the exception and record no ordinary sample
+    end
+
+    Stats-->>Agg: kv_connector_stats in existing worker output
+    Agg->>Agg: concatenate durations and sum keys
+    Agg-->>Sched: one aggregated connector payload
+    Sched->>Sched: apply connector output, then merge delayed state
+    Sched-->>Logger: SchedulerStats
+    Logger->>Registry: observe durations, inc keys, set Gauges
+    Scraper->>Registry: GET /metrics
+    Registry-->>Scraper: current registry snapshot
+```
+
+The collection frequency follows model-runner finalize cycles. It is not one
+RPC per GET and does not depend on the `/metrics` scrape frequency.
+
+#### Keep transient stats bounded
 
 Each worker stores elapsed-time floats only between two stats collections. On
 each model-runner finalize cycle, `get_stats()` swaps the current stats object
@@ -243,7 +371,24 @@ scheduler delayed-state payload replaces the previous Gauge snapshot only when
 it contains delayed-release fields, so worker-only stats cannot overwrite the
 authoritative scheduler value.
 
-### 4.7 Align with upstream metrics RFCs
+#### Source-level implementation plan
+
+The implementation keeps each change at the layer that owns the corresponding
+fact or transport hook.
+
+| File | Planned change | Result |
+| :--- | :--- | :--- |
+| `metrics.py` | Define `AscendStoreKVConnectorStats`, four Prometheus collectors, aggregation rules, and logger reduction | One serializable payload and one fixed-cardinality Prometheus adapter |
+| `pool_scheduler.py` | Maintain the delayed request set, per-request block map, running block total, and state-transition snapshots | O(1) current request/block Gauges with scheduler-authoritative values |
+| `pool_worker.py` | Time synchronous and TP-mismatch GET batches; record under a short lock; swap interval stats | Shared worker recording path without locking the backend call |
+| `kv_transfer.py` | Pass an optional `record_operation` callback into the asynchronous receive thread and invoke it once per returned GET batch | Async and sync non-layerwise loads have the same metric semantics |
+| `ascend_store_connector.py` | Route scheduler/worker stats and implement vLLM's stats and Prometheus factory hooks | Metrics enter the standard vLLM aggregation and `/metrics` path |
+| AscendStore unit tests | Cover state transitions, all-group block totals, aggregation, Prometheus dispatch, role routing, and GET exception behavior | Metric type, value, and failure-boundary regressions fail in CI |
+
+The plan does not modify vLLM core. It implements the existing connector
+extension points entirely inside vLLM Ascend.
+
+#### Align with upstream metrics RFCs
 
 This proposal follows the direction established in upstream vLLM discussions:
 
@@ -256,9 +401,9 @@ This proposal follows the direction established in upstream vLLM discussions:
   scheduler-side stats to be collected after worker output is applied. This
   proposal uses both rules.
 - [NIXL aggregation documentation issue #41230](https://github.com/vllm-project/vllm/issues/41230)
-  shows why multi-rank sample granularity must be documented. Section 4.3
-  therefore states that GET observations are worker backend batches, not
-  logical requests.
+  shows why multi-rank sample granularity must be documented. The all-worker
+  completion section therefore states that GET observations are worker backend
+  batches, not logical requests.
 - [Mooncake Store Connector RFC #38474](https://github.com/vllm-project/vllm/issues/38474)
   uses the same scheduler/worker split and background transfer model that
   AscendStore follows.
@@ -275,7 +420,7 @@ recording boundary, metric names, or public semantics.
 This RFC does not build a second declarative framework in vLLM Ascend while the
 upstream proposal is still evolving.
 
-## 5. Performance constraints
+### Performance constraints
 
 The design keeps the backend hot path independent of Prometheus. One completed
 GET batch adds:
@@ -297,7 +442,7 @@ instead of copying Mooncake Store's richer status/bytes/failed-key record for
 every batch. The generic `record_operation` boundary remains available for a
 future operation, but no unused labels or payload fields are allocated today.
 
-## 6. Querying the metrics
+### Querying the metrics
 
 A direct HTTP scrape returns the current Gauge values and process-lifetime
 Histogram/Counter accumulators:
@@ -357,44 +502,44 @@ scrape interval improves visibility. If operators later require an audit trail
 of every transition, that is a separate event-log or cumulative-Counter
 requirement rather than a reason to change the current-state Gauge semantics.
 
-## 7. Alternatives considered
+### Alternatives considered
 
-### Logs only
+#### Logs only
 
 Debug logs can identify request IDs, but they do not provide a cheap current
 aggregate, standard dashboard query, or alerting source. Logs remain useful for
 drill-down after a Gauge indicates pressure.
 
-### Only a delayed-block Gauge
+#### Only a delayed-block Gauge
 
 This is smaller but loses request scale. Ten retained blocks could represent
 one request or ten requests, which have different operational implications.
 
-### A cumulative delayed-request Counter
+#### A cumulative delayed-request Counter
 
 This records historical transitions but does not answer whether any request is
 blocked now. It also cannot measure current capacity pressure. The proposal
 does not add it.
 
-### Request ID as a Prometheus label
+#### Request ID as a Prometheus label
 
 This would expose per-request detail directly but creates an unbounded time
 series for every request. The cardinality and memory cost conflict with the
 performance requirement.
 
-### Last-GET-latency Gauge
+#### Last-GET-latency Gauge
 
 A last-value Gauge is unstable under concurrent workers and does not support a
 meaningful average or percentile. A standard Histogram preserves bounded
 memory and supports arbitrary query windows.
 
-### An in-process rolling window
+#### An in-process rolling window
 
 Maintaining one-minute samples in every worker duplicates Prometheus and adds
 expiration work, clocks, and state to the service. Monotonic Histogram/Counter
 series let the monitoring system choose the window instead.
 
-### Copy the full upstream Mooncake Store schema
+#### Copy the full upstream Mooncake Store schema
 
 Mooncake Store records operation, status, bytes, and failed-key dimensions for
 several RPC types. That model is a useful extension reference, but allocating
@@ -402,7 +547,7 @@ those records and labels for a single required GET operation is unnecessary.
 This proposal preserves the same connector interfaces and timing pattern while
 recording only required fields.
 
-## 8. Validation plan and evidence
+### Validation plan and evidence
 
 The implementation requires unit coverage for:
 
@@ -434,11 +579,12 @@ The delayed-release test temporarily withheld scheduler consumption of
 implementation contains no sleep, fault-injection switch, or dropped
 completion notification.
 
-## 9. Compatibility and rollout
+### Compatibility and rollout
 
 The metrics are additive. They do not change configuration, backend protocol,
 request outputs, or the `/metrics` endpoint contract. Runtime cost is limited
-to the state-transition and GET-recording work described in Section 5.
+to the state-transition and GET-recording work described under performance
+constraints.
 
 The initial implementation covers non-layerwise AscendStore. Layerwise
 offloading has different operation boundaries and completion semantics. A
@@ -451,7 +597,7 @@ Future extensions such as PUT latency, status, transferred bytes, or failed
 keys should follow the same rule: add a metric only with a defined operational
 question, stable sample granularity, and measured hot-path cost.
 
-## 10. Implementation references
+### Implementation references
 
 - [Connector stats and Prometheus adapter](../../../../vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metrics.py)
 - [Connector extension points](../../../../vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py)
@@ -459,3 +605,17 @@ question, stable sample granularity, and measured hot-path cost.
 - [Worker GET recording and stats snapshots](../../../../vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py)
 - [Asynchronous transfer timing](../../../../vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py)
 - [Metrics unit tests](../../../../tests/ut/distributed/ascend_store/test_metrics.py)
+
+## Feedback Period
+
+At least one week after submission to `vllm-project/vllm-ascend`.
+
+## CC List
+
+To be completed during personal review before community submission.
+
+## Any Other Things
+
+- Prototype implementation: [vllm-ascend PR #15602](https://github.com/vllm-project/vllm-ascend/pull/15602).
+- Submit this draft with the repository's `Request for comments (RFC)` Issue
+  form and the `RFC` label after personal review.
