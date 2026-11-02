@@ -104,6 +104,20 @@ class LayerwiseLayerCacheSpecs:
 
 
 @dataclass(frozen=True)
+class LayerwiseCacheTopology:
+    """Model-declared ordinary main packs and their allocation domains.
+
+    Members of an ordinary pack alias one backing but use disjoint group
+    block IDs. Auxiliary descriptors stay resident. This describes storage,
+    independently of the model family and the requested ring size.
+    """
+
+    main_packs: tuple[tuple[str, ...], ...]
+    group_ids: tuple[tuple[str, int], ...]
+    draft_layer_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LayerwiseReuseLayout:
     layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs]
     buffer_slots: tuple[tuple[int, ...], ...]
@@ -247,17 +261,12 @@ def build_layerwise_reuse_layout(
     layer_specs: dict[str, KVCacheSpec],
     base_layers: int,
     extra_config: dict[str, Any],
+    *,
+    topology: LayerwiseCacheTopology | None = None,
 ) -> LayerwiseReuseLayout:
-    """Fold ordinary GLM main packs, or share generic slots with identical specs."""
-    is_glm = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_specs.values())
-    if is_glm and any(get_physical_layer_index(name, base_layers) < base_layers for name in layer_specs):
-        # Draft forwards retain their own persistent caches and never advance
-        # the target's layerwise cursor. The names come from the real specs.
-        layer_specs = {
-            name: spec
-            for name, spec in layer_specs.items()
-            if get_physical_layer_index(name, base_layers) < base_layers
-        }
+    """Fold declared main packs, or share generic slots with identical specs."""
+    if topology is not None:
+        layer_specs = {name: spec for name, spec in layer_specs.items() if name not in topology.draft_layer_names}
     named_specs_by_layer: dict[int, list[NamedKVCacheSpec]] = {}
     for layer_name, layer_spec in layer_specs.items():
         physical_layer = get_physical_layer_index(layer_name, base_layers)
@@ -269,7 +278,18 @@ def build_layerwise_reuse_layout(
     independent_layer_set = set(independent_layers)
 
     layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs] = {}
+    declared_main_names = {name for pack in topology.main_packs for name in pack} if topology is not None else None
     for physical_layer, named_specs in named_specs_by_layer.items():
+        if declared_main_names is not None:
+            main_specs = [spec for spec in named_specs if spec.layer_name in declared_main_names]
+            if len(main_specs) != 1:
+                raise NotImplementedError("Main-pack reuse requires exactly one reusable main cache per physical layer")
+            main_spec = main_specs[0]
+            layer_cache_specs[physical_layer] = LayerwiseLayerCacheSpecs(
+                main=main_spec,
+                extra_main_specs=tuple(spec for spec in named_specs if spec is not main_spec),
+            )
+            continue
         if len(named_specs) == 1:
             layer_cache_specs[physical_layer] = LayerwiseLayerCacheSpecs(main=named_specs[0])
             continue
@@ -291,83 +311,42 @@ def build_layerwise_reuse_layout(
             extra_main_specs=extra_specs,
         )
 
-    signature_buckets: list[tuple[KVCacheSpec, list[int]]] = []
-    for physical_layer in physical_layers:
-        if physical_layer in independent_layer_set:
-            continue
-        # TODO(lf): Plan shared buffers independently for every cache spec.
-        # Slots are grouped by main spec. Indexer specs are validated separately.
-        signature = layer_cache_specs[physical_layer].main.spec
-        for bucket_signature, bucket_layers in signature_buckets:
-            if is_glm or signature == bucket_signature:
-                bucket_layers.append(physical_layer)
-                break
-        else:
-            signature_buckets.append((signature, [physical_layer]))
+    if topology is None:
+        signature_buckets: list[tuple[KVCacheSpec, list[int]]] = []
+        for physical_layer in physical_layers:
+            if physical_layer in independent_layer_set:
+                continue
+            # TODO(lf): Plan shared buffers independently for every cache spec.
+            # Slots are grouped by main spec. Indexer specs are validated separately.
+            signature = layer_cache_specs[physical_layer].main.spec
+            for bucket_signature, bucket_layers in signature_buckets:
+                if signature == bucket_signature:
+                    bucket_layers.append(physical_layer)
+                    break
+            else:
+                signature_buckets.append((signature, [physical_layer]))
 
-    buffer_slots: list[tuple[int, ...]] = [(layer,) for layer in independent_layers]
-    prefetch_layer_map: dict[int, int] = {}
-    for _, bucket_layers in signature_buckets:
-        num_shared_buffers = min(base_layout.num_shared_buffers, len(bucket_layers))
-        for buffer_index in range(num_shared_buffers):
-            layers_sharing_buffer = tuple(bucket_layers[buffer_index::num_shared_buffers])
-            buffer_slots.append(layers_sharing_buffer)
-            for owner_index in range(1, len(layers_sharing_buffer)):
-                prefetch_layer_map[layers_sharing_buffer[owner_index]] = layers_sharing_buffer[owner_index - 1]
+        buffer_slots: list[tuple[int, ...]] = [(layer,) for layer in independent_layers]
+        prefetch_layer_map: dict[int, int] = {}
+        for _, bucket_layers in signature_buckets:
+            num_shared_buffers = min(base_layout.num_shared_buffers, len(bucket_layers))
+            for buffer_index in range(num_shared_buffers):
+                layers_sharing_buffer = tuple(bucket_layers[buffer_index::num_shared_buffers])
+                buffer_slots.append(layers_sharing_buffer)
+                for owner_index in range(1, len(layers_sharing_buffer)):
+                    prefetch_layer_map[layers_sharing_buffer[owner_index]] = layers_sharing_buffer[owner_index - 1]
 
-    if is_glm:
-        from vllm_ascend.models.glm5next.cache_config import (
-            _group_glm5_next_mamba_layer_names,
-            _is_glm5_next_main_spec,
+    else:
+        buffer_slots, prefetch_layer_map = _fold_main_packs(
+            topology, layer_cache_specs, base_layout.num_shared_buffers, independent_layer_set
         )
-
-        mla_names = sorted(
-            (name for name, spec in layer_specs.items() if _is_glm5_next_main_spec(spec)),
-            key=lambda name: get_physical_layer_index(name, base_layers),
-        )
-        mamba_specs = {name: spec for name, spec in layer_specs.items() if isinstance(spec, MambaSpec)}
-        main_groups = [mla_names]
-        if mamba_specs:
-            main_groups.extend(_group_glm5_next_mamba_layer_names(layer_specs, mamba_specs))
-        ordinary_count = max(map(len, main_groups))
-        # Keep the normal cross-group packing: different groups allocate
-        # disjoint IDs from one global BlockPool. Only owners in the SAME
-        # group overwrite each other when an ordinary pack reuses a tensor.
-        ordinary_packs = [
-            tuple(get_physical_layer_index(group[index], base_layers) for group in main_groups if index < len(group))
-            for index in range(ordinary_count)
-        ]
-        resident_slots = [tuple(layer for layer in pack if layer in independent_layer_set) for pack in ordinary_packs]
-        resident_slots = [slot for slot in resident_slots if slot]
-        ring_packs = [tuple(layer for layer in pack if layer not in independent_layer_set) for pack in ordinary_packs]
-        ring_packs = [pack for pack in ring_packs if pack]
-        ring_count = min(base_layout.num_shared_buffers, len(ring_packs))
-        buffer_slots = list(resident_slots)
-        prefetch_layer_map = {}
-        if ring_count:
-            group_by_layer = {
-                get_physical_layer_index(name, base_layers): group_id
-                for group_id, group in enumerate(main_groups)
-                for name in group
-            }
-            for slot_index in range(ring_count):
-                slot_layers = tuple(layer for pack in ring_packs[slot_index::ring_count] for layer in pack)
-                buffer_slots.append(slot_layers)
-                previous_by_group: dict[int, int] = {}
-                for layer in slot_layers:
-                    group_id = group_by_layer[layer]
-                    if group_id in previous_by_group:
-                        prefetch_layer_map[layer] = previous_by_group[group_id]
-                    previous_by_group[group_id] = layer
-        if len(buffer_slots) >= ordinary_count:
-            # Keep accounting, allocation and runtime fences in ordinary mode
-            # together when the requested ring does not save any backing.
-            prefetch_layer_map = {}
 
     if prefetch_layer_map:
         if any(not is_prefix_cacheable(item.main.spec) for item in layer_cache_specs.values()):
             raise NotImplementedError("Private cache state must remain resident outside reusable main slots")
-        if any(is_prefix_cacheable(spec.spec) for item in layer_cache_specs.values() for spec in item.extra_main_specs):
+        if topology is None and any(
+            is_prefix_cacheable(spec.spec) for item in layer_cache_specs.values() for spec in item.extra_main_specs
+        ):
             raise NotImplementedError("Layerwise reuse does not support additional cacheable main components")
         unsupported_specs = [
             named_spec
@@ -378,7 +357,7 @@ def build_layerwise_reuse_layout(
             if not isinstance(named_spec.spec, AttentionSpec)
             and is_prefix_cacheable(named_spec.spec)
             and not (
-                is_glm
+                topology is not None
                 and isinstance(named_spec.spec, MambaSpec)
                 and named_spec.spec.mamba_cache_mode == "align"
                 and getattr(named_spec.spec, "num_prefill_checkpoint_blocks", 0) == 0
@@ -399,6 +378,60 @@ def build_layerwise_reuse_layout(
         independent_layers=independent_layers,
         num_prefetch_layers=base_layout.num_prefetch_layers,
         has_layer_reuse=bool(prefetch_layer_map),
+    )
+
+
+def _fold_main_packs(
+    topology: LayerwiseCacheTopology,
+    layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs],
+    num_shared_buffers: int,
+    independent_layers: set[int],
+) -> tuple[list[tuple[int, ...]], dict[int, int]]:
+    """Preserve ordinary aliases; fence only owners in the same group."""
+    layer_by_name = {item.main.layer_name: layer for layer, item in layer_cache_specs.items()}
+    names = [name for pack in topology.main_packs for name in pack]
+    if len(names) != len(set(names)) or set(names) != set(layer_by_name):
+        raise ValueError("Main packs must cover each reusable main cache exactly once")
+    groups = dict(topology.group_ids)
+    if len(groups) != len(topology.group_ids) or not set(names) <= groups.keys():
+        raise ValueError("Main packs require an unambiguous group for every cache owner")
+    for pack in topology.main_packs:
+        if not pack or len({groups[name] for name in pack}) != len(pack):
+            raise ValueError("Ordinary main-pack owners must belong to disjoint cache groups")
+    packs = [tuple(layer_by_name[name] for name in pack) for pack in topology.main_packs]
+    resident_slots = [tuple(layer for layer in pack if layer in independent_layers) for pack in packs]
+    buffer_slots = [slot for slot in resident_slots if slot]
+    ring_packs = [tuple(layer for layer in pack if layer not in independent_layers) for pack in packs]
+    ring_packs = [pack for pack in ring_packs if pack]
+    ring_count = min(num_shared_buffers, len(ring_packs))
+    predecessors = {}
+    for slot_index in range(ring_count):
+        slot = tuple(layer for pack in ring_packs[slot_index::ring_count] for layer in pack)
+        buffer_slots.append(slot)
+        previous_by_group = {}
+        for layer in slot:
+            group = groups[layer_cache_specs[layer].main.layer_name]
+            if group in previous_by_group:
+                predecessors[layer] = previous_by_group[group]
+            previous_by_group[group] = layer
+    # No physical saving means no scratch semantics or runtime fences.
+    if len(buffer_slots) >= len(packs):
+        predecessors = {}
+    return buffer_slots, predecessors
+
+
+def get_layerwise_reuse_layout(
+    kv_cache_config: KVCacheConfig, base_layers: int, extra_config: dict[str, Any]
+) -> LayerwiseReuseLayout:
+    """Consume the allocation plan, including on scheduler-side projections."""
+    layout = getattr(kv_cache_config, "layerwise_reuse_layout", None)
+    if layout is not None:
+        return layout
+    return build_layerwise_reuse_layout(
+        get_layerwise_kv_cache_specs(kv_cache_config),
+        base_layers,
+        extra_config,
+        topology=getattr(kv_cache_config, "layerwise_cache_topology", None),
     )
 
 
@@ -424,17 +457,24 @@ def apply_layerwise_kv_cache_plan(
     base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
     layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
     excluded_layer_names = (excluded_layer_names or set()) & layer_specs.keys()
-    is_glm = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_specs.values())
-    if is_glm:
-        excluded_layer_names |= {
-            name for name in layer_specs if get_physical_layer_index(name, base_layers) >= base_layers
+    topology = getattr(kv_cache_config, "layerwise_cache_topology", None)
+    if topology is not None:
+        actual_groups = {
+            name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
         }
+        if dict(topology.group_ids) != actual_groups:
+            raise ValueError("Main-pack topology must preserve the actual scheduler cache groups")
+        excluded_layer_names |= set(topology.draft_layer_names)
         kv_cache_config.layerwise_draft_layer_names = tuple(sorted(excluded_layer_names))
     reuse_layout = build_layerwise_reuse_layout(
         {name: spec for name, spec in layer_specs.items() if name not in excluded_layer_names},
         base_layers,
         extra_config,
+        topology=topology,
     )
+    kv_cache_config.layerwise_reuse_layout = reuse_layout
     actual_layers = len(reuse_layout.layer_cache_specs)
     if not reuse_layout.has_layer_reuse:
         return
@@ -480,7 +520,7 @@ def apply_layerwise_kv_cache_plan(
     if seen_layers != set(layer_specs):
         raise ValueError("Layerwise KV cache descriptors must cover every cache spec.")
 
-    if is_glm:
+    if topology is not None:
         ring_names = {
             reuse_layout.layer_cache_specs[layer].main.layer_name
             for slot in reuse_layout.buffer_slots
@@ -492,7 +532,7 @@ def apply_layerwise_kv_cache_plan(
         new_tensors = []
         for tensor in old_tensors:
             if tensor.offset or tensor.layer_stride:
-                raise NotImplementedError("GLM layerwise reuse requires ordinary unpacked descriptors")
+                raise NotImplementedError("Main-pack reuse requires ordinary unpacked descriptors")
             names = [name for name in get_kv_cache_tensor_layers(tensor) if name not in ring_names]
             if names:
                 new_tensors.append(replace(tensor, layers=names))
@@ -506,7 +546,7 @@ def apply_layerwise_kv_cache_plan(
                 continue
             page_sizes = {layer_specs[name].page_size_bytes for name in names}
             if len(page_sizes) != 1:
-                raise ValueError("GLM layerwise ring requires aligned main page sizes")
+                raise ValueError("Main-pack reuse requires aligned main page sizes")
             page_size = page_sizes.pop()
             new_tensors.append(
                 KVCacheTensor(
@@ -517,11 +557,15 @@ def apply_layerwise_kv_cache_plan(
                     block_stride=page_size,
                 )
             )
+        if sum(tensor.size for tensor in new_tensors) >= sum(tensor.size for tensor in old_tensors):
+            # A resident auxiliary view can pin an otherwise reusable backing.
+            # Judge savings from allocations, not just the number of ring slots.
+            kv_cache_config.layerwise_reuse_layout = replace(reuse_layout, prefetch_layer_map={}, has_layer_reuse=False)
+            return
         kv_cache_config.kv_cache_tensors = new_tensors
         kv_cache_config.layerwise_kv_cache_reuse = True
         logger.info(
-            "GLM layerwise main-pack ring merged %d descriptors into %d; "
-            "independent target layers=%s, draft caches=%d.",
+            "Layerwise main-pack ring merged %d descriptors into %d; independent target layers=%s, draft caches=%d.",
             len(old_tensors),
             len(new_tensors),
             reuse_layout.independent_layers,

@@ -24,6 +24,12 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, get_kv_cache_compression_ratio
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
+    LayerwiseCacheTopology,
+    apply_layerwise_kv_cache_plan,
+    get_layerwise_reuse_config,
+    get_physical_layer_index,
+)
 from vllm_ascend.utils import vllm_version_is
 
 # NPUModelRunner._allocate_int8_cache_tensor reserves this many extra bytes
@@ -419,12 +425,6 @@ def get_glm5_next_kv_cache_config(
 def _build_glm5_next_kv_cache_config(
     vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], num_blocks: int
 ) -> KVCacheConfig:
-    # Imported here because the layerwise planner also consumes GLM specs.
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
-        apply_layerwise_kv_cache_plan,
-        get_layerwise_reuse_config,
-    )
-
     layout = _get_glm5_next_cache_layout(groups)
     if layout is None:
         raise ValueError("Expected GLM-Next cache groups.")
@@ -499,6 +499,26 @@ def _build_glm5_next_kv_cache_config(
         kv_cache_groups=groups,
     )
     if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        draft_names = {
+            name
+            for group in groups
+            for name in group.layer_names
+            if get_physical_layer_index(name, base_layers) >= base_layers
+        }
+        main_names = set(layout.mla_names) | {name for group in layout.mamba_groups for name in group.layer_names}
+        # Publish the already-built ordinary packs. The reuse planner must not
+        # rediscover model grouping or infer allocation domains from layer order.
+        plan.layerwise_cache_topology = LayerwiseCacheTopology(
+            main_packs=tuple(
+                pack
+                for tensor in tensors
+                if (pack := tuple(name for name in tensor.layers if name in main_names and name not in draft_names))
+            ),
+            group_ids=tuple((name, group_id) for group_id, group in enumerate(groups) for name in group.layer_names),
+            draft_layer_names=tuple(sorted(draft_names)),
+        )
+        plan.kv_cache_allocation_alignment = GLM5_NEXT_CACHE_ALIGNMENT
         apply_layerwise_kv_cache_plan(plan, vllm_config)
     return plan
 

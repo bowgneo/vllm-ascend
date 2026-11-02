@@ -235,11 +235,14 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 self.num_layers = base_layers
                 self.layerwise_key_layers = base_layers
             if self.use_layerwise_transfer:
-                self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                    target_specs,
-                    base_layers,
-                    self._extra_config,
-                )
+                self._layerwise_reuse_layout = getattr(self.kv_cache_config, "layerwise_reuse_layout", None)
+                if self._layerwise_reuse_layout is None:
+                    self._layerwise_reuse_layout = build_layerwise_reuse_layout(
+                        target_specs,
+                        base_layers,
+                        self._extra_config,
+                        topology=getattr(self.kv_cache_config, "layerwise_cache_topology", None),
+                    )
                 if (
                     draft_names
                     and not self._layerwise_reuse_layout.has_layer_reuse
