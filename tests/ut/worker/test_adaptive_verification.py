@@ -1,4 +1,3 @@
-import importlib
 from contextlib import nullcontext
 from functools import partial
 from inspect import signature
@@ -62,7 +61,7 @@ def test_adaptive_verification_backend_capabilities(
             max_num_new_slots_for_drafting=0,
         )
     )
-    config = SimpleNamespace(speculative_config=speculative_config, use_v2_model_runner=True)
+    config = SimpleNamespace(speculative_config=speculative_config)
     spec = Mock()
     assert builder_cls.get_cudagraph_support(config, spec) is AttentionCGSupport.UNIFORM_BATCH
     assert builder_cls.get_varlen_cudagraph_max_query_len(config, spec) == expected_bound
@@ -99,18 +98,6 @@ def test_adaptive_tail_dummy_run_balances_moe_routing(adaptive_verification, con
     assert observed == [expected]
     runner.eplb.step.assert_called_once_with(is_dummy=True, is_profile=False)
     assert get_mrv2_in_profile_run() is False
-
-
-def test_adaptive_verification_patch_uses_uncompiled_budget_assignment(monkeypatch):
-    import vllm.v1.worker.gpu.spec_decode.adaptive_verification as adaptive
-
-    allocator = Mock()
-    monkeypatch.setattr(adaptive, "_assign_draft_token_budget", allocator, raising=False)
-    monkeypatch.setattr(adaptive, "_assign_draft_token_budget_compiled", object(), raising=False)
-    module = importlib.import_module("vllm_ascend.patch.worker.patch_adaptive_verification")
-    importlib.reload(module)
-
-    assert adaptive._assign_draft_token_budget_compiled is allocator
 
 
 @pytest.mark.parametrize(
@@ -157,7 +144,7 @@ def test_adaptive_draft_uses_its_own_request_count(monkeypatch, local_reqs, dp_r
     prepare_inputs = Mock()
     monkeypatch.setattr(dflash_module, "prepare_dflash_inputs_triton", prepare_inputs)
     prepare_entry = (
-        prepare_inputs if vllm_version_is("0.33.0") else dflash_module._prepare_dflash_inputs_with_block_stride
+        prepare_inputs if vllm_version_is("0.34.0") else dflash_module._prepare_dflash_inputs_with_block_stride
     )
     monkeypatch.setattr(upstream_dflash, "prepare_dflash_inputs", prepare_entry)
 
@@ -168,13 +155,12 @@ def test_adaptive_draft_uses_its_own_request_count(monkeypatch, local_reqs, dp_r
     # agreement, before dispatch can enter graph/device/collective execution.
     dispatch = Mock(side_effect=InputsPrepared)
     monkeypatch.setattr(upstream_dflash, "dispatch_cg_and_sync_dp", dispatch)
-    sync_kwargs = {} if vllm_version_is("0.33.0") else {"max_query_len": None}
     target_sync = DPSyncState(
         num_tokens_across_dp=torch.full((3,), target_capacity),
         uniform_token_count=None,
         eager=False,
         num_reqs=dp_reqs,
-        **sync_kwargs,
+        max_query_len=None,
     )
     with pytest.raises(InputsPrepared):
         spec.propose(
@@ -230,7 +216,6 @@ def _adaptive_manager_kwargs(groups, enabled=True, steps=3):
         prefill_len=SimpleNamespace(np=np.zeros(2, dtype=np.int32)),
     )
     config = SimpleNamespace(
-        use_v2_model_runner=True,
         speculative_config=SimpleNamespace(
             method="mtp", num_speculative_tokens=3, parallel_drafting=False, max_num_new_slots_for_drafting=0
         ),

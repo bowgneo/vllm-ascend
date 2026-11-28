@@ -4,8 +4,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionLoadGate
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     PoolKey,
     ReqMeta,
@@ -149,6 +150,7 @@ class SharedBlockData:
     req_ids: list[str]
     is_last_chunks: list[bool | None]
     block_keys: list[str] | None = None
+    scheduler_lease_mask: np.ndarray | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
 
@@ -175,5 +177,7 @@ class LayerLoadTask:
     wait_for_save_layers: tuple[int, ...]
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
-    attention_start_gate: AttentionComputeStartGate | None = None
+    load_gate: AttentionLoadGate | None = None
+    compute_boundary: torch.npu.Event | None = None
     scheduler_gva_copy_deadline: float | None = None
+    mixed_scheduler_gvas: np.ndarray | None = None

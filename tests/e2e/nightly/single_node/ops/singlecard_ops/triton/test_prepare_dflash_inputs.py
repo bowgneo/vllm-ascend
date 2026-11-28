@@ -249,6 +249,7 @@ ACCURACY_CASES = [
     },
     {
         "name": "query_position_clamp",
+        # Queries 62 and 63 keep their slots. The three rows past 63 must skip KV writes.
         "req_lens": [2],
         "position_starts": [60],
         "idx_mapping": [1],
@@ -478,6 +479,9 @@ def _build_reference(data, case):
             query_pos = last_valid_pos + 1 + query_off
             ref.input_ids[query_idx] = bonus_token if query_off == 0 else case["parallel_drafting_token_id"]
             ref.query_positions[query_idx] = min(query_pos, max_model_len - 1)
+            if query_pos >= max_model_len:
+                ref.query_slot_mapping[query_idx] = PAD_SLOT_ID
+                continue
             ref.query_slot_mapping[query_idx] = _local_slot(
                 query_pos, block_table[req_idx], block_size, block_stride, cp_rank, cp_size, cp_interleave
             )
@@ -640,7 +644,7 @@ def test_upstream_prepare_dflash_inputs_with_manager_blocks(case_name, sample_fr
         case["num_speculative_steps"] = case["num_query_per_req"]
     data = _build_inputs(case, "npu")
     args = _impl_args(data, case)
-    if not vllm_version_is("0.33.0"):
+    if not vllm_version_is("0.34.0"):
         # vLLM main takes block_stride after block_size. These cache pages are contiguous.
         args.insert(18, case["block_size"])
     prepare_dflash_inputs(*args)
@@ -654,7 +658,7 @@ def test_upstream_prepare_dflash_inputs_with_manager_blocks(case_name, sample_fr
 )
 def test_worker_entry_point_uses_ascend_launcher(monkeypatch):
     case = next(case for case in ACCURACY_CASES if case["name"] == "dcp_manager384_rank5").copy()
-    has_block_stride = not vllm_version_is("0.33.0")
+    has_block_stride = not vllm_version_is("0.34.0")
     if has_block_stride:
         case["block_stride"] = 768
     data = _build_inputs(case, "npu")
